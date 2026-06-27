@@ -112,6 +112,77 @@ def test_model_built_from_parameterizable_config(n_layer, vocab):
     assert out.shape == (2, 4, vocab)
 
 
+@pytest.mark.parametrize("n_embd,n_head", [(24, 6), (32, 8)])
+def test_config_wires_n_embd_and_n_head(n_embd, n_head):
+    """The model must read n_embd and n_head FROM THE CONFIG, not hardcode the
+    tiny defaults (16 and 4). We build with values that differ from both
+    defaults and assert the embedding channel width and the per-block attention
+    head-count actually reflect the config — a model that ignored cfg.n_embd /
+    cfg.n_head would either keep the wrong internal dims or fail to run here.
+    """
+    assert (n_embd, n_head) != (16, 4)  # guard: must differ from the defaults
+    cfg = _tiny_config(n_embd=n_embd, n_head=n_head)
+    model = GPT2(cfg)
+
+    # Token + positional embedding channels must equal cfg.n_embd.
+    assert model.wte.weight.shape == (cfg.vocab_size, n_embd)
+    assert model.wpe.weight.shape == (cfg.block_size, n_embd)
+
+    # Every block's attention must be constructed from cfg.n_head / cfg.n_embd.
+    for block in model.blocks:
+        assert block.attn.n_embd == n_embd
+        assert block.attn.n_head == n_head
+        # head_dim is a derived sanity check that the split used these values.
+        assert block.attn.head_dim == n_embd // n_head
+
+    # And the assembled stack still runs end-to-end with the non-default dims.
+    idx = torch.randint(0, cfg.vocab_size, (2, 4))
+    assert model(idx).shape == (2, 4, cfg.vocab_size)
+
+
+def test_lm_head_weight_is_tied_to_token_embedding():
+    """Weight tying is a defining GPT-2 property: the LM head reuses the token
+    embedding matrix. They must be the SAME parameter object — an independently
+    initialised lm_head would fail this `is` identity check.
+    """
+    cfg = _tiny_config()
+    model = GPT2(cfg)
+    assert model.lm_head.weight is model.wte.weight
+
+
+def test_final_layernorm_exists_and_is_applied_before_lm_head():
+    """A final LayerNorm (ln_f) must exist AND actually run on the forward path
+    feeding the LM head. Two independent checks make a model that omits ln_f
+    fail:
+
+      1. A forward hook on ln_f must fire during forward (proves it is called).
+      2. Perturbing ln_f's affine params must move the logits (proves its output
+         flows into the head, not a dead/ignored module).
+    """
+    cfg = _tiny_config()
+    model = GPT2(cfg)
+    model.eval()
+
+    assert isinstance(model.ln_f, torch.nn.LayerNorm)
+
+    fired = {"called": False}
+    handle = model.ln_f.register_forward_hook(lambda *a: fired.__setitem__("called", True))
+    idx = torch.randint(0, cfg.vocab_size, (1, 4))
+    with torch.no_grad():
+        logits_before = model(idx)
+    handle.remove()
+    assert fired["called"], "ln_f was never applied in the forward path"
+
+    # ln_f must genuinely feed the head: changing its affine params moves logits.
+    with torch.no_grad():
+        model.ln_f.weight.mul_(3.0)
+        model.ln_f.bias.add_(1.0)
+        logits_after = model(idx)
+    assert not torch.allclose(logits_before, logits_after, atol=1e-6), (
+        "perturbing ln_f did not change logits -> ln_f does not feed the lm_head"
+    )
+
+
 def test_rejects_sequence_longer_than_block_size():
     """Sequence length is bounded by block_size: exactly block_size is allowed,
     one token past it is rejected (both boundaries)."""
