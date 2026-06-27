@@ -15,6 +15,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 from typing import Dict, Iterable, List, Tuple, Union
 
 Pair = Tuple[int, int]
@@ -109,6 +110,55 @@ class BPETokenizer:
         """Decode a list of token ids back into text (inverse of ``encode``)."""
         tokens = b"".join(self.vocab[idx] for idx in ids)
         return tokens.decode("utf-8", errors="replace")
+
+    # ---- persistence -----------------------------------------------------
+
+    # Bump if the on-disk format ever changes incompatibly.
+    SCHEMA_VERSION = 1
+
+    def save(self, path: str) -> None:
+        """Persist the learned merge rules to ``path`` as human-readable JSON.
+
+        The merges are the complete source of truth: the full ``vocab`` is
+        deterministically rebuilt from the 256 base byte tokens by replaying
+        the merges in order, so only the merges need to be stored. Each merge
+        is written as ``[first_id, second_id, new_id]`` in learned order, which
+        keeps the file both readable and exactly reconstructable.
+        """
+        merges = [
+            [int(pair[0]), int(pair[1]), int(new_id)]
+            for pair, new_id in self.merges.items()
+        ]
+        # learned order matters for encode/decode; persist it deterministically.
+        merges.sort(key=lambda m: m[2])
+        payload = {"version": self.SCHEMA_VERSION, "merges": merges}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "BPETokenizer":
+        """Reconstruct a tokenizer from a file written by :meth:`save`.
+
+        The returned tokenizer's ``encode``/``decode`` behave identically to
+        the instance that was saved.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        version = payload.get("version")
+        if version != cls.SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported tokenizer file version {version!r}; "
+                f"expected {cls.SCHEMA_VERSION}"
+            )
+
+        tok = cls()
+        for first, second, new_id in payload["merges"]:
+            pair = (int(first), int(second))
+            new_id = int(new_id)
+            tok.merges[pair] = new_id
+            tok.vocab[new_id] = tok.vocab[pair[0]] + tok.vocab[pair[1]]
+        return tok
 
 
 def _demo() -> None:

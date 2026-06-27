@@ -2,6 +2,7 @@
 
 import ast
 import inspect
+import json
 
 import pytest
 
@@ -116,3 +117,67 @@ def test_train_accepts_iterable_of_strings():
     tok.train(["the quick brown fox ", "jumps over the lazy dog "] * 50, vocab_size=300)
     text = "the lazy fox"
     assert tok.decode(tok.encode(text)) == text
+
+
+def test_save_writes_human_readable_json(tmp_path):
+    """save(path) must persist the learned merges as readable JSON."""
+    tok = BPETokenizer()
+    tok.train(CORPUS, vocab_size=300)
+    path = tmp_path / "tok.json"
+    tok.save(str(path))
+
+    assert path.exists()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    # one entry per learned merge — the merges are the persisted source of truth.
+    assert len(data["merges"]) == len(tok.merges) == 300 - 256
+
+
+def test_load_roundtrip_identical_encode(tmp_path):
+    """Round-trip across persistence: a reloaded tokenizer must produce the
+    EXACT same encode output as the one that was saved.
+
+    A fresh, untrained tokenizer would emit raw bytes for the same text, so
+    asserting equality with the trained ids (which are fewer than the bytes)
+    distinguishes a real load from a no-op constructor.
+    """
+    tok = BPETokenizer()
+    tok.train(CORPUS, vocab_size=300)
+    text = "the quick brown fox jumps over the lazy dog"
+    expected = tok.encode(text)
+
+    path = tmp_path / "tok.json"
+    tok.save(str(path))
+    restored = BPETokenizer.load(str(path))
+
+    assert isinstance(restored, BPETokenizer)
+    assert restored.encode(text) == expected
+    # merges were genuinely restored — compression happened, not raw bytes.
+    assert len(restored.encode(text)) < len(text.encode("utf-8"))
+    # untrained baseline really would differ, proving the test isn't vacuous.
+    assert BPETokenizer().encode(text) != expected
+
+
+def test_load_roundtrip_identical_decode(tmp_path):
+    """A reloaded tokenizer must decode losslessly, including unseen unicode."""
+    tok = BPETokenizer()
+    tok.train(CORPUS, vocab_size=300)
+    path = tmp_path / "tok.json"
+    tok.save(str(path))
+    restored = BPETokenizer.load(str(path))
+
+    text = "héllo 世界 🚀 the lazy dog"
+    assert restored.decode(restored.encode(text)) == text
+    # decode of the original's ids on the restored tokenizer matches too.
+    assert restored.decode(tok.encode(text)) == text
+
+
+def test_save_load_preserves_merge_order(tmp_path):
+    """Merge order is semantically significant; load must preserve it exactly."""
+    tok = BPETokenizer()
+    tok.train(CORPUS, vocab_size=300)
+    path = tmp_path / "tok.json"
+    tok.save(str(path))
+    restored = BPETokenizer.load(str(path))
+
+    assert restored.merges == tok.merges
+    assert restored.vocab == tok.vocab
